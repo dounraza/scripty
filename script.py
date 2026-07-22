@@ -14,7 +14,7 @@ import mysql.connector
 
 # Database Configuration
 DB_CONFIG = {
-    'host': 'localhost',
+    'host': 'http://192.168.1.129/',
     'user': 'root',
     'password': '',
     'database': 'cpp_trans_prod'
