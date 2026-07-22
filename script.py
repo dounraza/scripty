@@ -41,38 +41,38 @@ async def lifespan(app: FastAPI):
     # Startup logic
     thread = threading.Thread(target=run_sync_periodically, daemon=True)
     thread.start()
-    print("Background sync thread started.")
+    print("Le thread de synchronisation en arrière-plan a démarré.")
     yield
     # Shutdown logic (if needed)
-    print("Application shutting down.")
+    print("Arrêt de l'application.")
 
 app = FastAPI(lifespan=lifespan)
 
-def check_manifold_exists(session, vehicle, date_str):
-    start_of_day = f"{date_str}T00:00:00.000Z"
-    end_of_day = f"{date_str}T23:59:59.999Z"
-    
+def normalize_vehicle(v):
+    if not v or v == "Sans véhicule":
+        return v
+    return v.replace(" ", "").upper()
+
+def check_manifold_exists(session, vehicle):
     manifolds_where = {
-        "vehiculNumber": vehicle,
-        "generatedAt": {
-            "$gte": {"__type": "Date", "iso": start_of_day},
-            "$lte": {"__type": "Date", "iso": end_of_day},
-        },
+        "vehiculNumber": normalize_vehicle(vehicle),
     }
    
     try:
         response = session.get(
             f"{PARSE_HOST}/endpoint/classes/CompanyManifold",
             headers=headers,
-            params={"where": json.dumps(manifolds_where)},
+            params={"where": json.dumps(manifolds_where), "order": "-createdAt", "limit": 1},
             timeout=30,
         )
         
         manifolds = response.json().get("results", [])
-        return len(manifolds) > 0
+        if manifolds:
+            return manifolds[0].get("generatedAt", {}).get("iso")
+        return None
     except Exception as e:
         print(f"Erreur lors de la vérification du manifold pour {vehicle} :", e)
-        return False
+        return None
 
 def sync():
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -156,8 +156,8 @@ def sync():
                 or "Unknown"
             )
             product_name = product.get("name", "Unknown")
-            vehicle = reservation.get("guest", "Sans véhicule")
-            quantity = reservation.get("quantity", 1)
+            vehicle = normalize_vehicle(reservation.get("guest", "Sans véhicule"))
+            quantity = reservation.get("default_quantity", 0)
             transaction = reservation.get("transaction", [])
 
             status_id = None
@@ -182,11 +182,24 @@ def sync():
         departures = {}
         processed = set()
         
+        # Allowed statuses for departures
         ALLOWED_STATUSES = {"Payé", "P.A", "Partiel"}
+        
+        # Open connection/cursor once
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        # Charger les IDs existants pour éviter les doublons
+        cursor.execute("SELECT objectIdCompanyReservation FROM dashboard_stats WHERE stat_date = %s", (today_str,))
+        existing_res_rows = cursor.fetchall()
+        existing_res_ids = set()
+        for row in existing_res_rows:
+            if row[0]:
+                existing_res_ids.update(row[0].split(','))
 
         for reservation in reservations:
             object_id = reservation.get("objectId")
-            if not object_id or object_id in processed:
+            if not object_id or object_id in processed or object_id in existing_res_ids:
                 continue
             
             transaction = reservation.get("transaction", [])
@@ -202,8 +215,18 @@ def sync():
                 continue
                 
             processed.add(object_id)
-            vehicle = reservation.get("guest", "Sans véhicule")
+            vehicle = normalize_vehicle(reservation.get("guest", "Sans véhicule"))
             line = reservation.get("product", {}).get("name", "N/A")
+            
+            # Extract IDs
+            reservation_id = object_id
+            transaction_data = reservation.get("transaction", [])
+            transaction_id = None
+            if isinstance(transaction_data, list) and len(transaction_data) > 0:
+                transaction_id = transaction_data[0].get("objectId")
+            elif isinstance(transaction_data, dict):
+                transaction_id = transaction_data.get("objectId")
+
             departures.setdefault(vehicle, {})
             if line not in departures[vehicle]:
                 created = reservation.get("createdAt")
@@ -217,55 +240,65 @@ def sync():
                     "depart": depart,
                     "passagers": 0,
                     "status": readable_status,
+                    "reservation_ids": [],
+                    "transaction_ids": []
                 }
-            departures[vehicle][line]["passagers"] += reservation.get("quantity", 0)
+            departures[vehicle][line]["passagers"] += reservation.get("default_quantity", 0)
+            departures[vehicle][line]["reservation_ids"].append(reservation_id)
+            if transaction_id:
+                departures[vehicle][line]["transaction_ids"].append(transaction_id)
 
-        unique_vehicles = set()
-        total_passengers = 0
-        for catalog in summary.values():
-            for product in catalog.values():
-                total_passengers += product["total_quantity"]
-                for vehicle in product["vehicles"]:
-                    if vehicle != "Sans véhicule":
-                        unique_vehicles.add(vehicle)
+        # Process updates and insertions for departures
+        for vehicle, lines in departures.items():
+            for line, data in lines.items():
+                generated_at_iso = check_manifold_exists(session, vehicle)
+                status_manifold = 'oui' if generated_at_iso else 'non'
+                
+                # Update 'depart' with generatedAt if available, else keep existing or default
+                if generated_at_iso:
+                    try:
+                        data['depart'] = datetime.fromisoformat(generated_at_iso.replace("Z", "+00:00")).strftime("%H:%M")
+                    except Exception:
+                        pass
+                
+                res_ids = ",".join(data["reservation_ids"])
+                trx_ids = ",".join(data["transaction_ids"])
 
-        try:
-            conn = mysql.connector.connect(**DB_CONFIG)
-            cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT total_quantity, statusManifold, objectIdCompanyReservation, objectIdTransaction FROM dashboard_stats WHERE stat_date = %s AND vehicle = %s AND ligne = %s",
+                    (today_str, vehicle, line)
+                )
+                existing_record = cursor.fetchone()
 
-            for vehicle, lines in departures.items():
-                for line, data in lines.items():
-                    status_manifold = 'oui' if check_manifold_exists(session, vehicle, today_str) else 'non'
-                    new_quantity = data['passagers']
-
-                    cursor.execute(
-                        "SELECT total_quantity, statusManifold FROM dashboard_stats WHERE stat_date = %s AND vehicle = %s AND ligne = %s",
-                        (today_str, vehicle, line)
-                    )
-                    existing_record = cursor.fetchone()
-
-                    if existing_record:
-                        existing_quantity, existing_status_manifold = existing_record
-                        if existing_quantity != new_quantity or existing_status_manifold != status_manifold:
-                            cursor.execute(
-                                """UPDATE dashboard_stats 
-                                   SET total_quantity = %s, statusManifold = %s, status = %s 
-                                   WHERE stat_date = %s AND vehicle = %s AND ligne = %s""",
-                                (new_quantity, status_manifold, status_manifold, today_str, vehicle, line)
-                            )
-                    else:
+                if existing_record:
+                    (existing_quantity, existing_status_manifold, existing_res_ids, existing_trx_ids) = existing_record
+                    
+                    # Vérifier si les données ont changé pour ce véhicule et cette ligne
+                    if (existing_quantity != data['passagers'] or 
+                        existing_status_manifold != status_manifold or 
+                        existing_res_ids != res_ids or 
+                        existing_trx_ids != trx_ids):
+                        
                         cursor.execute(
-                            """INSERT INTO dashboard_stats 
-                               (stat_date, catalog, ligne, vehicle, total_quantity, total_ca, depart, status, statusManifold, total_passengers_today, total_vehicles_today)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                            (today_str, data['catalog'], line, vehicle, new_quantity, 0, f"{data['depart']}:00", status_manifold, status_manifold, total_passengers, len(unique_vehicles))
+                            """UPDATE dashboard_stats 
+                               SET total_quantity = %s, statusManifold = %s, status = %s, 
+                                   objectIdCompanyReservation = %s, objectIdTransaction = %s, depart = %s 
+                               WHERE stat_date = %s AND vehicle = %s AND ligne = %s""",
+                            (data['passagers'], status_manifold, status_manifold, res_ids, trx_ids, f"{data['depart']}:00", today_str, vehicle, line)
                         )
-            conn.commit()
-            cursor.close()
-            conn.close()
-            print(f"[{datetime.now()}] Statistiques insérées/mises à jour dans MySQL")
-        except mysql.connector.Error as err:
-            print(f"[{datetime.now()}] Erreur MySQL :", err)
+                else:
+                    # Insertion de nouveaux enregistrements
+                    cursor.execute(
+                        """INSERT INTO dashboard_stats 
+                           (stat_date, catalog, ligne, vehicle, total_quantity, total_ca, depart, status, statusManifold, objectIdCompanyReservation, objectIdTransaction)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (today_str, data['catalog'], line, vehicle, data['passagers'], 0, f"{data['depart']}:00", data['status'], status_manifold, res_ids, trx_ids)
+                    )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print(f"[{datetime.now()}] Statistiques insérées/mises à jour dans MySQL")
+
 
         print(f"[{datetime.now()}] Synchronisation terminée")
     except Exception as e:

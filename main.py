@@ -39,6 +39,11 @@ headers = {
     "X-Parse-REST-API-Key": REST_API_KEY,
 }
 
+def normalize_vehicle(v):
+    if not v or v == "Sans véhicule":
+        return v
+    return v.replace(" ", "").upper()
+
 def sync():
     # Update TODAY dynamically for each run
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -134,8 +139,8 @@ def sync():
                 or "Unknown"
             )
             product_name = product.get("name", "Unknown")
-            vehicle = reservation.get("guest", "Sans véhicule")
-            quantity = reservation.get("quantity", 1)
+            vehicle = normalize_vehicle(reservation.get("guest", "Sans véhicule"))
+            quantity = reservation.get("default_quantity", 0)
             transaction = reservation.get("transaction", [])
 
             reservation_ca = 0
@@ -201,7 +206,7 @@ def sync():
                 continue
                 
             processed.add(object_id)
-            vehicle = reservation.get("guest", "Sans véhicule")
+            vehicle = normalize_vehicle(reservation.get("guest", "Sans véhicule"))
             line = reservation.get("product", {}).get("name", "N/A")
             departures.setdefault(vehicle, {})
             if line not in departures[vehicle]:
@@ -217,7 +222,7 @@ def sync():
                     "passagers": 0,
                     "status": readable_status,
                 }
-            departures[vehicle][line]["passagers"] += reservation.get("quantity", 0)
+            departures[vehicle][line]["passagers"] += reservation.get("default_quantity", 0)
 
         # ===========================
         # Totals
